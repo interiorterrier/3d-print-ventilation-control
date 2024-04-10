@@ -1,0 +1,521 @@
+#include <dht11.h>
+
+
+// include the header file
+// control for heater and ventilation device with heat-exchanger
+// by interiorterrier
+// interiorterrier@gmail.com
+#include <Arduino.h>
+#include <AdKeyboard.h> // Keyboard Bibliothek
+#include <Wire.h> 
+#include <LiquidCrystal_I2C.h> // LCD Bibliothek
+#include <dht11.h> // Sensor Bibliothek
+
+int taste = 4;
+int dauer = 50;
+
+int modus = 0;                   // numeric value for control type (0=Manuell, 1=Thermostat, 2=Hygrostat, 3=Automatik)
+int heaterState = 0;           // Heizregister an oder aus
+int coolDown = 0;                // Is the Heater cooling down?
+float automaticTemp = 22;           // Sollwert für die Temperatur
+float criticalTemp = 40;             // fans on Level 5 when critical Temp is reached
+float automaticHumidity = 50;      // Sollwert für die Luftfeuchte
+int heatRequired = 0;             // Is heat required (0/1)
+const int hysterese = 2;                // Abweichung zwischen Soll-Wert und Ist-Wert (Fester Wert) 
+
+// define millis for fake multitasking
+unsigned long currentMillis = 0;        //the actual millis value is stored here
+// define periods for fake multitasking
+unsigned long readPreviousDHT = 0;     //the last time, the sensors were read-out
+// unsigned long readPreviousDHT1 = 0;
+// unsigned long readPreviousDHT2 = 0;
+// unsigned long readPreviousDHT3 = 0;
+const unsigned long readSensorPeriod = 5000;   // time until next sensor read-out
+
+unsigned long previousPrint = 0;           
+const unsigned long printPeriod = 4000;
+
+unsigned long previousTaste = 0;
+const unsigned long tastePeriod = 6000;
+
+unsigned long previousHeater = 0;
+const unsigned long heaterPeriod = 6000;
+
+unsigned long previousAutomatic = 0;          // Timestamp, when was the last time we checked the temperature/humidity
+const unsigned long automaticPeriod = 6000;   // Period to the next check of temperature/humidity in millieseconds
+
+unsigned long previousfanHeatChill = 0;       // Timestamp, when was the last time we updated fanspeed, PTC heater etc.
+const unsigned long fanHeatChillPeriod = 1000;  // Period to the next check of fanspeed, PTC heater etc.
+
+unsigned long previousSwitchHeater = 0;       // Timestamp, when was the last time we switched the heater
+const unsigned long SwitchHeaterPeriod = 60000;  // Savety Period since last time switching heater
+
+// Temp/Humidity Input Pin
+#define DHT11PIN0 2 
+#define DHT11PIN1 3
+#define DHT11PIN2 4
+#define DHT11PIN3 5
+// Relay Output Pins for 12V Heater
+#define relayPin1 6
+#define relayPin2 7
+// #define DHTTYPE0 DHT11
+
+// instantiate several dht11 sensors
+dht11 DHT11_0; 
+dht11 DHT11_1;
+dht11 DHT11_2;
+dht11 DHT11_3;
+
+// Set the LCD address to 0x27 for a 16 chars and 2 line display
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+//create custom character Celsius Symbol
+byte customChar[8] = {
+  0b01100,
+  0b10010,
+  0b10010,
+  0b01100,
+  0b00000,
+  0b00000,
+  0b00000,
+  0b00000
+  };
+
+// instantiate it on Analog0 of the arduino board
+AdKeyboard adKeyboard(0); 
+
+// PWM Variablen deklarieren
+const int fan_exhaust_pin = 9; // Blue wire on fan(25 kHz)
+int count = 0;
+unsigned long start_time;
+int rpm; // this is needed when you want to read the rpm signal of the pwm-fan
+int pwm;
+int pwmAutomatic;
+int pwmManuell = 64;
+int fanspeed;
+int fanspeedManuell;
+
+
+void setup() {
+
+//Set digital pins to Output so we can sink any current supplied to them
+digitalWrite (relayPin1, HIGH);
+digitalWrite (relayPin2, HIGH);
+pinMode (relayPin1, OUTPUT);
+pinMode (relayPin2, OUTPUT);
+
+//Prepare PWM Signal with 25kHz
+//Timing Register set to zero
+TCCR1A = 0 ;
+TCCR1B = 0;
+TCNT1 = 0;
+
+TCCR1A = _BV(COM1A1) | _BV(COM1B1) | _BV(WGM11);
+TCCR1B = _BV(WGM13) | _BV(CS10);
+ICR1 = 320;
+pinMode (fan_exhaust_pin, OUTPUT);
+OCR1A = 0;
+OCR1B = 0;
+Serial.begin(9600);
+adKeyboard.setClickCallback(clickHandler);
+adKeyboard.setPressCallback(pressHandler);
+adKeyboard.setTwoPressCallback(twoPressHandler);
+
+ // initialize the LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.createChar(0, customChar); // create a new custom character
+  lcd.clear();
+	lcd.print("Lueftung/Heizung");
+  lcd.setCursor(0,1);
+  lcd.print("+ Waermetauscher");
+  delay(4000);
+}
+
+void checkSensors() {
+ if (currentMillis - readSensorPeriod >= readPreviousDHT){
+   readPreviousDHT = currentMillis;
+  int chkdht0 = DHT11_0.read(DHT11PIN0);
+  int chkdht1 = DHT11_1.read(DHT11PIN1);
+  int chkdht2 = DHT11_2.read(DHT11PIN2);
+  int chkdht3 = DHT11_3.read(DHT11PIN3);
+ }
+}
+
+void resetKey() {
+  if (currentMillis - tastePeriod >= previousTaste){
+   previousTaste = currentMillis;
+   taste = 5;
+}
+}
+void loop() {
+  // put your main code here, to run repeatedly:
+  // every function is called, using the millis (internal clock)
+  
+  adKeyboard.update();               // Getting Keyboard entrys
+  currentMillis = millis();          // The millis Value is stored in currentMillis for fake Multitasking
+  checkSensors();                    // Reading the sensors
+  printValues();                     // Printing values on the LCD Display
+  resetKey();                        // Key number 4 is triggerd to show basic informations
+  checkAutomatic();                  // thermostat, hygrostat and automatic mode is executed
+  checkfanHeaterChill();             // The fan, PTC-Heater and Peltier-Cooler are controlled
+  checkHeater();                     // Switch PTC-Heater ON or OFF
+} 
+
+void clickHandler(int key) {              // Execute when button is pressed once
+  if ((key == 1) && (pwmManuell <= 257) && (modus == 0)){       //if button 1 is pressed and we are in manuell-modus then increment the fan speed 1/5, hier wird die Variable "key" verwendet weil die variable "taste" nicht zurückgesetzt wird und die Lüfterstufen automatisch hochschalten würde
+    pwmManuell +=64;
+    // OCR1A = pwm;
+    fanspeedManuell = (pwmManuell/64);
+    lcd.clear();
+    lcd.print("Luefterstufe: ");
+    lcd.print(fanspeedManuell);
+    lcd.setCursor(0,1);
+    lcd.print("ausgewaehlt");
+    if (coolDown == 1){       //if PTC is cooling down display this
+       delay(dauer*40);
+       lcd.clear();
+       lcd.print("PTC kuehlt ab");
+       lcd.setCursor(0,1);
+       lcd.print("bitte warten ");
+       lcd.print(DHT11_1.temperature, 0);
+     }
+  }
+  if ((key == 2) && (pwmManuell >= 63) && (modus == 0)){       //if button 2 is pressed  and we are in manuell-modus then decrease the fan speed 1/5
+    pwmManuell -=64;
+    // OCR1A = pwm;
+    fanspeedManuell = (pwmManuell/64);
+    lcd.clear();
+    lcd.print("Luefterstufe: ");
+    lcd.print(fanspeedManuell);
+    lcd.setCursor(0,1);
+    lcd.print("ausgewaehlt");
+     if (coolDown == 1){       //if PTC is cooling down display this
+       delay(dauer*40);
+       lcd.clear();
+       lcd.print("PTC kuehlt ab");
+       lcd.setCursor(0,1);
+       lcd.print("bitte warten ");
+       lcd.print(DHT11_1.temperature, 0);
+     }
+  }
+  
+  if ((key == 1) && (modus == 1)){       //if button 1 is pressed and we are in thermostat-modus then increment the temperature by 1 degree celsius
+    automaticTemp +=1;
+    lcd.clear();
+    lcd.print("Solltemperatur: ");
+    lcd.setCursor(0,1);
+    lcd.print(automaticTemp);
+    lcd.write((byte)0);  // print the custom char Celsius Symbol
+  }
+  if ((key == 2) && (modus == 1)){       //if button 2 is pressed  and we are in thermostat-modus then decrease the Temperature by 1 degree celsius
+    automaticTemp -=1;
+    lcd.clear();
+    lcd.print("Solltemperatur: ");
+    lcd.setCursor(0,1);
+    lcd.print(automaticTemp);
+    lcd.write((byte)0);  // print the custom char Celsius Symbol
+  }
+  if ((key == 1) && (modus == 2)){       //if button 1 is pressed and we are in hygrostat-modus then increment the Humidity by 1 %
+    automaticHumidity +=1;
+    lcd.clear();
+    lcd.print("Soll%: ");
+    lcd.setCursor(0,1);
+    lcd.print(automaticHumidity);
+    lcd.print("%");
+  }
+  if ((key == 2) && (modus == 2)){       //if button 2 is pressed  and we are in hygrostat-modus then decrease the Humidity by 1 %
+    automaticHumidity -=1;
+    lcd.clear();
+    lcd.print("Soll%: ");
+    lcd.setCursor(0,1);
+    lcd.print(automaticHumidity);
+    lcd.print("%");
+  }
+
+  if ((key == 0)) {       //if button 2 is pressed then switch control modus to the next modus. (As savety-measurement one can only switch to other modus when the heater is cooled down <= 40)
+   switch (modus) {   // At every key-stroke switch one modus further (0=Manuell, 1=Thermostat, 2=Hygrostat, 3=Automatik)
+     case 0:
+      modus = 1; //Switch to Thermostat Modus
+      break;     // Exit Switch-Loop
+     case 1:
+      modus = 2;  //Switch to Hygrostat Modus
+      break;      // Exit Switch-Loop
+     case 2:
+      modus = 3;  //Switch to Automatik Modus
+      break;      // Exit Switch-Loop
+     case 3:
+      modus = 0;    //Switch to Manuell Modus
+      break;        // Exit Switch-Loop
+     default:
+     break;
+    }
+   if (modus == 1) {    // Wich Value is stored in the string variable ModusString? If 1 then display Thermostat Values
+      lcd.clear();    // Display löschen 
+      lcd.print("Thermostat-Modus");
+      lcd.setCursor(0,1);
+      lcd.print("Solltemp.: ");
+      lcd.print(automaticTemp , 0);
+      lcd.write((byte)0);  // print the custom char Celsius Symbol
+      //pwmAutomatic = pwmManuell;  // the actual pwm are taken into pwmAutomatic as long as Automtic control is on
+    }
+    if (modus == 2) {    // Wich Value is stored in the string variable ModusString? If 2 then display Hygrostat Values
+      lcd.clear();
+      lcd.print("Hygrostat-Modus");
+      lcd.setCursor(0,1);
+      lcd.print("Soll %: ");
+      lcd.print(automaticHumidity , 0);
+      lcd.print("%");  // print the % Symbol for Humidity
+      //pwmAutomatic = pwmManuell;
+      heatRequired = 0;
+    }
+    if (modus == 3) {    // Wich Value is stored in the string variable ModusString? If 1 then display Automatik Values
+      lcd.clear();
+      lcd.print("Automatik-Modus");
+      lcd.setCursor(0,1);
+      lcd.print("Soll: ");
+      lcd.print(automaticTemp , 0);
+      lcd.write((byte)0);  // print the custom char Celsius Symbol
+      lcd.print(" ");
+      lcd.print(automaticHumidity , 0);
+      lcd.print("%");  // print the % Symbol for Humidity
+      //pwmAutomatic = pwmManuell;
+    }
+    if (modus == 0) {    // Wich Value is stored in the string variable ModusString? If 1 then display Manuell Values
+      lcd.clear();
+      lcd.print("Manueller-Modus");
+      heatRequired = 0;  // Heizregister ausschalten
+    }
+    delay(dauer*2);
+  }
+  taste = key;                             // Der key-Wert wird in Taste übernommen für "printOnDisplay" key kann nicht übergeben werden.
+  printOnDisplay();
+  previousTaste = currentMillis;           // Reset Timer for switching to standart view
+}
+
+void printValues() {                        // check Timestamp and print Values after a certain period
+ if (currentMillis - printPeriod >= previousPrint){
+   previousPrint = currentMillis;
+   printOnDisplay();
+ }
+}
+
+void printOnDisplay(){                      // check wich "taste" was pressed and print the values
+  
+  //if (taste == 0) {       // button 0 is checked in the click handler function
+  //}
+  
+  if (taste == 3) {       //if button 3 is pressed then display exhaust air values
+  //Sensor 2
+
+  lcd.clear();
+  delay(dauer);
+  lcd.print("AbEin ");
+  lcd.print((float)DHT11_2.temperature, 1);
+  lcd.write((byte)0);  // print the custom char at (2, 0)
+  lcd.print("C");
+
+  lcd.print(" ");
+  lcd.print((float)DHT11_2.humidity, 0);
+  lcd.print("%");
+ 
+  // sensor 3
+
+  lcd.setCursor(0,1);
+  lcd.print("AbAus ");
+  lcd.print((float)DHT11_3.temperature, 1);
+  lcd.write((byte)0);  // print the custom char at (2, 0)
+  lcd.print("C");
+  
+  lcd.print(" ");
+  lcd.print((float)DHT11_3.humidity, 0);
+  lcd.print("%");
+
+  delay(dauer);
+  }
+
+  if (taste == 5) {       //if virtual button 5 is pressed then display exhaust air values
+  //Allgemeine Informationen anzeigen
+  lcd.clear();
+  lcd.print("i");
+  lcd.print((float)DHT11_2.humidity, 0);
+  lcd.print("%");
+  lcd.print(" Vent");
+  lcd.print(fanspeed);
+  lcd.print(" Heiz");
+  lcd.print(heaterState);
+  lcd.setCursor(0,1);
+  lcd.print("i");
+  //int chk2 = DHT11_2.read(DHT11PIN0);
+  lcd.print((float)DHT11_2.temperature, 0);
+  lcd.write((byte)0);  // print the custom char at (2, 0)
+  //lcd.print("C");
+  if (modus == 0) {    // Wich Value is stored in the string variable ModusString? If 0 then display Manuell Values
+      if (coolDown == 0) {                // is the ptc allready cooled down?
+      lcd.print("a");
+      lcd.print((float)DHT11_0.temperature, 0);
+      lcd.write((byte)0);  // print the custom char at (2, 0)
+      lcd.print("z");
+      lcd.print((float)DHT11_1.temperature, 0);
+      lcd.write((byte)0);  // print the custom char at (2, 0)
+      lcd.print("ab");
+      lcd.print((float)DHT11_3.temperature, 0);
+      lcd.write((byte)0);  // print the custom char at (2, 0)
+      }
+      if (coolDown == 1) {                      // is the ptc cooling down?
+      lcd.print(" PTC kuehlen");
+      lcd.print(DHT11_1.temperature, 0);
+      }
+  }
+  if (modus == 1) {    // Wich Value is stored in the string variable ModusString? If 1 then display Thermostat Values
+      lcd.print("Thermost.");
+      lcd.print(automaticTemp , 0);   // Display target temperature
+      lcd.write((byte)0);  // print the custom char at (2, 0)
+  }
+  if (modus == 2) {    // Wich Value is stored in the string variable ModusString? If 2 then display Thermostat Values
+      lcd.print(" Hygrost.");
+      lcd.print(automaticHumidity , 0); //Display target humidity
+      lcd.print("%");
+  }
+  if (modus == 3) {    // Wich Value is stored in the string variable ModusString? If 3 then display Full Automatik Values
+      lcd.print(" Auto");
+      lcd.print(automaticTemp , 0);   // Display target temperature
+      lcd.write((byte)0);  // print the custom char at (2, 0)
+      lcd.print(" ");
+      lcd.print(automaticHumidity , 0); //Display target humidity
+      lcd.print("%");
+  }
+  }
+}
+void pressHandler(int key) {              // Execute when button is pressed longer
+
+  if ((key == 1) && (pwmManuell <= 257)) {       //if button 1 is pressed then drive the fan with full speed
+    pwmManuell = 320;
+    // OCR1A = pwm;
+    fanspeedManuell = (pwmManuell/64);
+    lcd.clear();
+    lcd.print("Luefterstufe: ");
+    lcd.print(fanspeedManuell);
+    lcd.setCursor(0,1);
+    lcd.print("ausgewaehlt");
+  }
+  if ((key == 2) && (pwmManuell >= 63)){       //if button 2 is pressed then switch off the fan
+    pwmManuell =0;
+    // OCR1A = pwm;
+    fanspeedManuell = (pwmManuell/64);
+    lcd.clear();
+    lcd.print("Luefterstufe: ");
+    lcd.print(fanspeedManuell);
+    lcd.setCursor(0,1);
+    lcd.print("ausgewaehlt");
+  }
+  if ((key == 2) && (pwm >= 63) && (coolDown == 1)){       //if button 2 is pressed  but the heater is still cooling down print this
+    lcd.clear();
+    lcd.print("Heizung auf ");
+    lcd.print(DHT11_1.temperature, 0);
+    lcd.write((byte)0);  // print the custom char at (2, 0)
+    lcd.setCursor(0,1);
+    lcd.print("bitte warten ");
+    
+  }
+  Serial.print("pressHandler: ");
+  Serial.println(key);
+}
+void twoPressHandler(int k1, int k2) {
+  Serial.print("twoPressHandler: ");
+  Serial.print(k1);
+  Serial.print(" ");
+  Serial.println(k2);
+} 
+
+void checkAutomatic(){
+  if (currentMillis - automaticPeriod >= previousAutomatic){
+   previousAutomatic = currentMillis;
+   automatic();
+  }
+}
+
+void automatic() {    // automatic control of fans and heater. 
+  if (modus == 1)  {  // are we in thermostat modus
+    if (DHT11_2.temperature >= automaticTemp) {
+      heatRequired = 0;
+      // if (DHT11_1.temperature <= 40) {
+      //  pwmAutomatic = pwm;
+      //  OCR1A = pwmAutomatic;
+      //  fanspeed = (pwmAutomatic/64);
+    }
+    if (DHT11_2.temperature < (automaticTemp - hysterese)) {
+      heatRequired = 1;
+      if (currentMillis <= SwitchHeaterPeriod) {  // When this function is called to early after starting the device
+       heatRequired = 0;
+      }
+      // heaterState = 1;
+      // pwmAutomatic = 320;
+      // OCR1A = pwmAutomatic;
+      // fanspeed = (pwmAutomatic/64);
+    } 
+       
+  }
+}
+
+void checkHeater(){
+  if (currentMillis - heaterPeriod >= previousHeater){
+   previousHeater = currentMillis;
+   switchHeater();
+  }
+}
+
+void switchHeater(){
+  if (heaterState == 1){
+    digitalWrite (relayPin1, LOW);
+    digitalWrite (relayPin2, LOW);
+  }
+  if (heaterState == 0){
+    digitalWrite (relayPin1, HIGH);
+    digitalWrite (relayPin2, HIGH);
+  }
+}
+
+void checkfanHeaterChill(){
+  if (currentMillis - fanHeatChillPeriod >= previousfanHeatChill){
+   previousfanHeatChill = currentMillis;
+   fanHeaterChillControl();
+  }
+}
+
+void fanHeaterChillControl(){
+  if (heatRequired == 1 && heaterState == 0){  // Switching on heater and maxing out the fanspeed
+   lcd.clear();
+   lcd.print("Heizregister an");
+   heaterState = 1;
+   pwmAutomatic = 320;
+   OCR1A = pwmAutomatic;
+   fanspeed = (pwmAutomatic/64);
+  }
+  if (heatRequired == 0 && heaterState == 1){
+   lcd.clear();
+   lcd.print("Heizregister aus");
+   heaterState = 0;
+   previousSwitchHeater = currentMillis;
+   pwmAutomatic = 320;
+   OCR1A = pwmAutomatic;
+   fanspeed = (pwmAutomatic/64);
+   coolDown = 1;                             // we are in PTC cool down period
+  }
+  if (heatRequired == 0 && heaterState == 0 && DHT11_1.temperature > 40){
+   //lcd.clear();
+   //lcd.print("Temperatur > 40");
+   pwmAutomatic = 320;
+   OCR1A = pwmAutomatic;
+   fanspeed = (pwmAutomatic/64);
+   coolDown = 1;                         // we are in PTC cool down period
+  }
+  if (heatRequired == 0 && heaterState == 0 && DHT11_1.temperature <= 40 && (currentMillis - SwitchHeaterPeriod >= previousSwitchHeater)){
+   //lcd.clear();
+   //lcd.print("Temperatur < 40");
+   OCR1A = pwmManuell;
+   fanspeed = (pwmManuell/64);
+   coolDown = 0;                           // we are no longer in PTC cool down period
+  }
+}
+
